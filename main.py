@@ -4,183 +4,195 @@ import pandas as pd
 import folium
 from streamlit_folium import st_folium
 from geopy.distance import geodesic
+from streamlit_autorefresh import st_autorefresh
 import random
 from datetime import datetime
 
 # --- DATABASE SETUP ---
 def init_db():
-    conn = sqlite3.connect('geo_race.db', check_same_thread=False)
+    conn = sqlite3.connect('geo_extreme.db', check_same_thread=False)
     c = conn.cursor()
-    # Users: Credentials and overall score
-    c.execute('''CREATE TABLE IF NOT EXISTS users 
-                 (username TEXT PRIMARY KEY, password TEXT, total_score REAL)''')
-    # Sessions: Custom named servers with target locations
+    c.execute('CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT, total_score REAL)')
+    # Added boundary_km to sessions
     c.execute('''CREATE TABLE IF NOT EXISTS sessions 
-                 (session_name TEXT PRIMARY KEY, creator TEXT, target_lat REAL, target_long REAL, status TEXT)''')
-    # Progress: Live tracking of players within sessions
+                 (session_name TEXT PRIMARY KEY, creator TEXT, target_lat REAL, target_long REAL, 
+                  boundary_km REAL, status TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS progress 
-                 (session_name TEXT, username TEXT, current_lat REAL, current_long REAL, distance_to_go REAL, 
-                  last_updated TEXT, PRIMARY KEY(session_name, username))''')
+                 (session_name TEXT, username TEXT, current_lat REAL, current_long REAL, 
+                  distance_to_go REAL, last_updated TEXT, PRIMARY KEY(session_name, username))''')
     conn.commit()
     return conn
 
 conn = init_db()
 
-# --- GEOLOCATION LOGIC ---
-def get_browser_location():
-    """Attempts to get GPS via JS. Returns None if denied or unavailable."""
-    js_code = """
-    <script>
-    navigator.geolocation.getCurrentPosition(
-        (pos) => {
-            window.parent.postMessage({
-                type: 'streamlit:set_component_value',
-                value: {lat: pos.coords.latitude, lon: pos.coords.longitude}
-            }, '*');
-        },
-        (err) => { console.error("Location denied"); },
-        { enableHighAccuracy: true }
-    );
-    </script>
-    """
-    st.components.v1.html(js_code, height=0)
-    return st.session_state.get("location_data")
+# --- REFRESH LOGIC ---
+# This forces the app to rerun every 5 seconds to get "Live" updates
+st_autorefresh(interval=5000, key="datarefresh")
 
-# --- APP CONFIG ---
-st.set_page_config(page_title="Geo-Quest Pro", layout="wide", page_icon="📍")
-st.markdown("""
-    <style>
-    .main { background-color: #0e1117; color: white; }
-    .stButton>button { width: 100%; border-radius: 20px; }
-    </style>
-    """, unsafe_allow_html=True)
+# --- HELPER: GENERATE NEW LOCATION ---
+def generate_new_target(session_name, center_lat, center_lon, radius_km):
+    # Roughly 1 degree ~= 111km
+    offset = radius_km / 111.0
+    new_lat = center_lat + random.uniform(-offset, offset)
+    new_long = center_lon + random.uniform(-offset, offset)
+    conn.execute('UPDATE sessions SET target_lat=?, target_long=? WHERE session_name=?', 
+                 (new_lat, new_long, session_name))
+    conn.commit()
+    # Clear previous progress for the new round
+    conn.execute('DELETE FROM progress WHERE session_name=?', (session_name,))
+    conn.commit()
+
+# --- APP SETUP ---
+st.set_page_config(page_title="Mimo Geo-Quest AI", layout="wide")
 
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 
-# --- SIDEBAR: AUTH & USER INFO ---
+# --- SIDEBAR: AUTH ---
 with st.sidebar:
-    st.title("🛡️ Player Portal")
+    st.title("📍 Geo-Quest Pro")
     if not st.session_state.logged_in:
-        mode = st.radio("Access", ["Login", "Sign Up"])
-        u = st.text_input("Username")
-        p = st.text_input("Password", type="password")
-        if st.button("Enter Game"):
-            if mode == "Login":
-                res = conn.execute('SELECT * FROM users WHERE username=? AND password=?', (u, p)).fetchone()
-                if res:
-                    st.session_state.logged_in = True
-                    st.session_state.username = u
-                    st.rerun()
-                else: st.error("Wrong credentials.")
-            else:
-                try:
-                    conn.execute('INSERT INTO users VALUES (?,?,?)', (u, p, 0))
-                    conn.commit()
-                    st.success("Account Ready!")
-                except: st.error("Name taken.")
+        u = st.text_input("User")
+        p = st.text_input("Pass", type="password")
+        if st.button("Login"):
+            res = conn.execute('SELECT * FROM users WHERE username=? AND password=?', (u, p)).fetchone()
+            if res:
+                st.session_state.logged_in = True
+                st.session_state.username = u
+                st.rerun()
+        if st.button("Sign Up"):
+            try:
+                conn.execute('INSERT INTO users VALUES (?,?,0)', (u, p))
+                conn.commit()
+                st.success("User Created")
+            except: st.error("Error")
     else:
         st.write(f"Logged in as: **{st.session_state.username}**")
         if st.button("Logout"):
             st.session_state.logged_in = False
             st.rerun()
 
-# --- MAIN CONTENT ---
+# --- MAIN LOGIC ---
 if st.session_state.logged_in:
-    tab1, tab2, tab3 = st.tabs(["🏠 Lobby", "🎯 Active Mission", "🏆 Hall of Fame"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Lobby", "Mission Control", "Leaderboard", "🛡️ Moderator"])
 
     with tab1:
-        st.subheader("Create or Join a Server")
-        c1, c2 = st.columns(2)
+        st.subheader("Servers")
+        col_c, col_j = st.columns(2)
+        with col_c:
+            s_name = st.text_input("Server Name")
+            s_bound = st.number_input("Boundary (KM from current loc)", min_value=1.0, value=5.0)
+            if st.button("Host New Game"):
+                # Initial target is 0,0 - will be updated once moderator gets location
+                conn.execute('INSERT INTO sessions VALUES (?,?,?,?,?,?)', 
+                             (s_name, st.session_state.username, 23.23, 87.07, s_bound, "ACTIVE"))
+                conn.commit()
+                st.success("Server Created! Go to Moderator tab to set first target.")
         
-        with c1:
-            st.write("### Host a Session")
-            new_sess_name = st.text_input("Enter a unique Server Name", placeholder="e.g. Mimo-Elite-Race")
-            if st.button("Launch Server"):
-                if new_sess_name:
-                    # Pick a random target within a 5km radius of a center point (example: Bankura area)
-                    t_lat = 23.23 + random.uniform(-0.03, 0.03)
-                    t_long = 87.07 + random.uniform(-0.03, 0.03)
-                    try:
-                        conn.execute('INSERT INTO sessions VALUES (?,?,?,?,?)', 
-                                     (new_sess_name, st.session_state.username, t_lat, t_long, "ACTIVE"))
-                        conn.commit()
-                        st.success(f"Server '{new_sess_name}' is LIVE!")
-                    except: st.error("A server with that name already exists!")
-                else: st.warning("Please name your server.")
+        with col_j:
+            active_s = pd.read_sql_query("SELECT session_name, creator, boundary_km FROM sessions WHERE status='ACTIVE'", conn)
+            st.dataframe(active_s, hide_index=True)
+            to_join = st.selectbox("Select Server", active_s['session_name'].tolist() if not active_s.empty else [])
+            if st.button("Join Server"):
+                st.session_state.current_session = to_join
 
-        with c2:
-            st.write("### Available Servers")
-            active_df = pd.read_sql_query("SELECT session_name, creator FROM sessions WHERE status='ACTIVE'", conn)
-            if not active_df.empty:
-                st.dataframe(active_df, use_container_width=True, hide_index=True)
-                join_name = st.selectbox("Select Server", active_df['session_name'].tolist())
-                if st.button("Join"):
-                    st.session_state.current_session = join_name
-                    st.info(f"Connected to {join_name}")
-            else:
-                st.info("No active servers. Create one!")
-
+    # --- GEOLOCATION COMPONENT ---
+    # We use a simple text-based manual override + JS Bridge
+    js_geo = """
+    <script>
+    navigator.geolocation.getCurrentPosition((pos) => {
+        window.parent.postMessage({
+            type: 'streamlit:set_component_value',
+            value: {lat: pos.coords.latitude, lon: pos.coords.longitude}
+        }, '*');
+    });
+    </script>
+    """
+    st.components.v1.html(js_geo, height=0)
+    
+    # MISSION TAB
     with tab2:
         if "current_session" in st.session_state:
-            sess_data = conn.execute('SELECT * FROM sessions WHERE session_name=?', (st.session_state.current_session,)).fetchone()
-            target = (sess_data[2], sess_data[3])
+            s_data = conn.execute('SELECT * FROM sessions WHERE session_name=?', (st.session_state.current_session,)).fetchone()
+            target = (s_data[2], s_data[3])
             
-            st.write(f"## Mission: {st.session_state.current_session}")
-            
-            # --- LOCATION HANDLING ---
-            loc = get_browser_location()
-            
-            if not loc:
-                st.warning("⚠️ Automatic GPS unavailable. Please enter your coordinates manually below.")
-                col_lat, col_lon = st.columns(2)
-                manual_lat = col_lat.number_input("Your Latitude", value=23.2300, format="%.6f")
-                manual_lon = col_lon.number_input("Your Longitude", value=87.0700, format="%.6f")
-                current_coords = (manual_lat, manual_lon)
+            # Use data from JS or fallback to manual
+            loc_data = st.session_state.get("location_data")
+            if loc_data:
+                u_lat, u_lon = loc_data['lat'], loc_data['lon']
             else:
-                current_coords = (loc['lat'], loc['lon'])
-                st.success("✅ Real-time GPS Locked")
-
-            # Calculate distance
-            dist = geodesic(current_coords, target).meters
+                st.warning("Waiting for GPS... or enter manually:")
+                u_lat = st.number_input("Lat", value=23.2300, key="mlat")
+                u_lon = st.number_input("Lon", value=87.0700, key="mlon")
             
-            # Update Live Progress in DB
+            user_coords = (u_lat, u_lon)
+            dist = geodesic(user_coords, target).meters
+            
+            # Update position in DB for others to see
             conn.execute('INSERT OR REPLACE INTO progress VALUES (?,?,?,?,?,?)',
-                         (st.session_state.current_session, st.session_state.username, 
-                          current_coords[0], current_coords[1], dist, datetime.now().isoformat()))
+                         (st.session_state.current_session, st.session_state.username, u_lat, u_lon, dist, datetime.now().isoformat()))
             conn.commit()
 
-            # --- VISUALS ---
-            m_col, d_col = st.columns([3, 1])
-            with m_col:
-                m = folium.Map(location=current_coords, zoom_start=14)
-                folium.Marker(current_coords, popup="You", icon=folium.Icon(color='blue')).add_to(m)
-                folium.Marker(target, popup="Goal", icon=folium.Icon(color='red', icon='star')).add_to(m)
-                st_folium(m, width="100%", height=500)
+            # MAP VISUALS
+            m = folium.Map(location=user_coords, zoom_start=15)
+            # Shortest Path (Line)
+            folium.PolyLine([user_coords, target], color="blue", weight=2.5, opacity=1, tooltip="Shortest Path").add_to(m)
+            # User Marker
+            folium.Marker(user_coords, popup="You", icon=folium.Icon(color='blue', icon='user')).add_to(m)
+            # Target Marker
+            folium.Marker(target, popup="Goal", icon=folium.Icon(color='red', icon='flag')).add_to(m)
+            # 50m WIN ZONE
+            folium.Circle(radius=50, location=target, color="green", fill=True, fill_opacity=0.3).add_to(m)
+            
+            st_folium(m, width="100%", height=500, key="game_map")
 
-            with d_col:
-                st.metric("Distance", f"{dist:.1f} m")
-                if dist < 30:
-                    st.balloons()
-                    st.success("TARGET REACHED!")
-                    if st.button("Claim Victory"):
-                        conn.execute('UPDATE users SET total_score = total_score + 100 WHERE username=?', (st.session_state.username,))
-                        conn.commit()
-                        st.rerun()
+            # WINNING CONDITION
+            if dist <= 50:
+                st.balloons()
+                st.success("🎉 MISSION ACCOMPLISHED! You reached the 50m zone.")
+                # Update Score
+                conn.execute('UPDATE users SET total_score = total_score + 100 WHERE username=?', (st.session_state.username,))
+                # Trigger New Location for the session
+                generate_new_target(st.session_state.current_session, target[0], target[1], s_data[4])
+                st.rerun()
 
-            # --- MULTIPLAYER LIST ---
-            st.write("### 🏃 Live Opponents")
+            # Live Opponents List
+            st.write("### 🏃 LIVE TRACKER")
             opps = pd.read_sql_query("SELECT username, distance_to_go FROM progress WHERE session_name=? ORDER BY distance_to_go ASC", 
                                     conn, params=(st.session_state.current_session,))
             st.table(opps)
         else:
-            st.write("Join a server in the Lobby to start the race!")
+            st.info("Join a server in the Lobby")
 
+    # LEADERBOARD TAB
     with tab3:
-        st.subheader("Global Rankings")
-        ranks = pd.read_sql_query("SELECT username, total_score FROM users ORDER BY total_score DESC", conn)
-        st.dataframe(ranks, use_container_width=True, hide_index=True)
+        st.subheader("Global Leaderboard")
+        board = pd.read_sql_query("SELECT username, total_score FROM users ORDER BY total_score DESC", conn)
+        st.dataframe(board, use_container_width=True, hide_index=True)
 
-else:
-    st.header("Welcome to Geo-Quest AI")
-    st.write("A real-time location-based multiplayer race. Sign in to start.")
+    # MODERATOR TAB
+    with tab4:
+        if "current_session" in st.session_state:
+            s_data = conn.execute('SELECT * FROM sessions WHERE session_name=?', (st.session_state.current_session,)).fetchone()
+            if s_data[1] == st.session_state.username:
+                st.success("🛡️ You are the Moderator of this Session")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    new_bound = st.slider("Adjust Boundary (KM)", 1, 50, int(s_data[4]))
+                    if st.button("Update Boundary & Generate New Target"):
+                        generate_new_target(st.session_state.current_session, s_data[2], s_data[3], new_bound)
+                        conn.execute('UPDATE sessions SET boundary_km=? WHERE session_name=?', (new_bound, st.session_state.current_session))
+                        conn.commit()
+                        st.rerun()
+                
+                with col2:
+                    if st.button("🛑 End Current Game"):
+                        conn.execute('UPDATE sessions SET status="ENDED" WHERE session_name=?', (st.session_state.current_session,))
+                        conn.commit()
+                        st.warning("Game Ended")
+                        st.rerun()
+            else:
+                st.error("You are not the moderator of this session.")
+        else:
+            st.info("Join your own session to see moderator controls.")
